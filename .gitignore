@@ -1,0 +1,51 @@
+# OS (macOS)
+.DS_Store
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+.DocumentRevisions-V100
+.fseventsd
+.TemporaryItems
+.apdisk
+.VolumeIcon.icns
+._*
+
+# OS (Windows)
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+System Volume Information/
+*.lnk
+
+# Editors/IDEs
+.vscode/
+.idea/
+*.iml
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Logs & temp
+*.log
+logs/
+*.tmp
+*.swp
+*.swo
+*~
+
+# Caches
+.cache/
+.pytest_cache/
+
+# Environment files (secrets)
+.env
+.env.local
+.env.*.local
