@@ -45,4 +45,20 @@ likelihood:
 
 
 
+  # =============================================================================
+# DDPM Forward Process Configuration
+# =============================================================================
+
+ddpm_forward:
+  # Required parameters
+  latent_dim: 10                    # Dimension of latent space z^(0)
+  n_diffusion_steps: 1000           # Number of diffusion timesteps T
+  
+  # Optional parameters (with defaults)
+  beta_schedule: 'linear'           # Variance schedule type: 'linear', 'cosine', 'quadratic'
+  beta_min: 1.0e-4                  # Minimum β_t value
+  beta_max: 2.0e-2                  # Maximum β_t value
+
+
+
   
