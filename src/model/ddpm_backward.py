@@ -1,162 +1,96 @@
 """
-scARKIDS DDPM Backward (Reverse) Process Module
+DDPM Backward (Reverse) Process Module for scARKIDS
+====================================================
 
-Implements the reverse (denoising) diffusion process for both supervised and
-unsupervised VAE-DDPM models.
+Implements the reverse (denoising) diffusion process for VAE-DDPM model.
 
-Mathematical Framework:
+Mathematical Background:
+-----------------------
 
-=== SUPERVISED MODE ===
-Reverse process conditioned on known cell type c*:
-
-Full trajectory:
+Reverse Process (Supervised - known cell type c*):
     p_ψ(z^(0:T) | c*) = p(z^(T)) ∏_{t=1}^{T} p_ψ(z^(t-1) | z^(t), c*)
 
-Single reverse step:
-    p_ψ(z^(t-1) | z^(t), c*) = N(z^(t-1) | μ_ψ(z^(t), t, c*), Σ_ψ(z^(t), t, c*))
+Reverse Process (Unsupervised - predicted cell type c):
+    p_ψ(z^(0:T) | c) = p(z^(T)) ∏_{t=1}^{T} p_ψ(z^(t-1) | z^(t), c)
+
+Single Reverse Step:
+    p_ψ(z^(t-1) | z^(t), c) = N(z^(t-1) | μ_ψ(z^(t), t, c), Σ_ψ(z^(t), t, c))
 
 Parameterization (noise prediction formulation):
-    μ_ψ(z^(t), t, c*) = (1/√α_t) * (z^(t) - (β_t/√(1-ᾱ_t)) * ε_ψ(z^(t), t, c*))
+    μ_ψ(z^(t), t, c) = (1/√α_t) * (z^(t) - (β_t/√(1-ᾱ_t)) * ε_ψ(z^(t), t, c))
 
 where ε_ψ is a neural network predicting noise.
 
-Variance: Σ_ψ = σ_t² I
-where σ_t² = β_t or learned.
+Variance:
+    Σ_ψ = σ_t² I, where σ_t² = β_t (fixed) or learned
 
-=== UNSUPERVISED MODE ===
-Reverse process conditioned on predicted (random) cell type c:
+Key Difference from Forward:
+    - Forward process is FIXED (no learnable parameters)
+    - Reverse process is LEARNED (ε_ψ network is trained)
 
-Full trajectory:
-    p_ψ(z^(0:T)) = p(z^(T)) ∏_{t=1}^{T} p_ψ(z^(t-1) | z^(t), c)
-
-Key difference: c is now a random variable (not fixed).
-
-Single reverse step:
-    p_ψ(z^(t-1) | z^(t), c) = N(z^(t-1) | μ_ψ(z^(t), t, c), Σ_ψ(z^(t), t, c))
-
-Parameterization (same form as supervised):
-    μ_ψ(z^(t), t, c) = (1/√α_t) * (z^(t) - (β_t/√(1-ᾱ_t)) * ε_ψ(z^(t), t, c))
-
-=== KEY COMPONENTS ===
-
-1. Noise Prediction Network ε_ψ(z^(t), t, c):
-   - Input: noisy latent z^(t), timestep t, cell type c
-   - Output: predicted noise ε̂
-   - Architecture: MLP with timestep and cell type embeddings
-
-2. Mean Prediction:
-   - Formula: μ_ψ = (1/√α_t) * (z^(t) - (β_t/√(1-ᾱ_t)) * ε̂)
-   - Computed using variance schedule from forward process
-
-3. Variance Prediction:
-   - Fixed: σ_t² = β_t (standard DDPM)
-   - Learnable: σ_t² can be learned (improved DDPM)
-   - Variance Σ_ψ = σ_t² I (isotropic Gaussian)
-
-4. Sampling Process:
-   - Start from z^(T) ~ N(0, I)
-   - For t = T, T-1, ..., 1:
-       - Predict noise: ε̂ = ε_ψ(z^(t), t, c)
-       - Compute mean: μ = (1/√α_t) * (z^(t) - (β_t/√(1-ᾱ_t)) * ε̂)
-       - Sample: z^(t-1) = μ + σ_t * ε', where ε' ~ N(0, I)
-   - Return z^(0)
-
-=== DESIGN PRINCIPLES ===
-1. No union gene set masking (all batches have same genes)
-2. Unified architecture for supervised and unsupervised modes
-3. Noise prediction formulation for better training stability
-4. Support for both fixed and learned variance
-5. OOP design with clear separation of concerns
-6. Comprehensive logging and error handling
+Note: The same reverse network handles both supervised and unsupervised modes.
+The only difference is whether c is known (supervised) or predicted (unsupervised).
 """
 
+from src.utils.logger import Logger
+from dataclasses import dataclass
+from typing import Dict, Tuple, Optional
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from typing import Optional, Dict, Tuple
-from dataclasses import dataclass
-import numpy as np
-from abc import ABC, abstractmethod
-
-from src.utils.logger import Logger
-
-logger = Logger.get_logger(__name__)
 
 # ============================================================================
-# CONFIGURATION
+# Configuration
 # ============================================================================
 
 @dataclass
 class DDPMBackwardConfig:
-    """Configuration for DDPM backward process with validation."""
+    """
+    Configuration for the DDPM Backward Process module.
     
-    latent_dim: int                    # Dimension of latent space z
-    n_diffusion_steps: int             # Number of diffusion steps T
-    n_cell_types: int                  # Number of cell types C
+    Attributes:
+        latent_dim: Dimension of latent space z^(0)
+        n_diffusion_steps: Number of diffusion timesteps T
+        n_cell_types: Number of cell types C
+        variance_type: Variance strategy ('fixed' or 'learned')
+        noise_hidden_dim: Hidden dimension for noise prediction network
+        noise_n_layers: Number of layers in noise prediction network
+        timestep_embed_dim: Dimension of timestep embedding
+        celltype_embed_dim: Dimension of cell type embedding
+        dropout: Dropout rate for noise prediction network
+    """
     
-    # Noise network architecture
-    noise_network_hidden_dim: int = 256     # Hidden layer dimension
-    noise_network_n_layers: int = 3         # Number of hidden layers
-    noise_network_dropout: float = 0.1      # Dropout probability
-    
-    # Timestep embedding
-    timestep_embed_dim: int = 128      # Dimension of timestep embedding
-    
-    # Cell type embedding
-    celltype_embed_dim: int = 64       # Dimension of cell type embedding
-    
-    # Variance strategy
-    variance_type: str = "fixed"       # "fixed" or "learned"
-    
-    # Other settings
-    device: str = "cpu"
+    latent_dim: int
+    n_diffusion_steps: int
+    n_cell_types: int
+    variance_type: str = 'fixed'
+    noise_hidden_dim: int = 128
+    noise_n_layers: int = 2
+    timestep_embed_dim: int = 64
+    celltype_embed_dim: int = 32
+    dropout: float = 0.1
     
     def __post_init__(self):
-        """Validate all parameters."""
-        
-        if self.latent_dim <= 0:
-            raise ValueError(f"latent_dim must be > 0, got {self.latent_dim}")
-        
-        if self.n_diffusion_steps <= 0:
-            raise ValueError(
-                f"n_diffusion_steps must be > 0, got {self.n_diffusion_steps}"
-            )
-        
-        if self.n_cell_types <= 0:
-            raise ValueError(
-                f"n_cell_types must be > 0, got {self.n_cell_types}"
-            )
-        
-        if self.noise_network_hidden_dim <= 0:
-            raise ValueError(
-                f"noise_network_hidden_dim must be > 0, got {self.noise_network_hidden_dim}"
-            )
-        
-        if self.noise_network_n_layers <= 0:
-            raise ValueError(
-                f"noise_network_n_layers must be > 0, got {self.noise_network_n_layers}"
-            )
-        
-        if not (0.0 <= self.noise_network_dropout < 1.0):
-            raise ValueError(
-                f"noise_network_dropout must be in [0, 1), got {self.noise_network_dropout}"
-            )
-        
-        if self.variance_type not in ["fixed", "learned"]:
-            raise ValueError(
-                f"variance_type must be 'fixed' or 'learned', got {self.variance_type}"
-            )
-        
-        logger.info(
-            f"DDPMBackwardConfig: latent_dim={self.latent_dim}, "
-            f"n_diffusion_steps={self.n_diffusion_steps}, "
-            f"n_cell_types={self.n_cell_types}, "
-            f"variance_type={self.variance_type}"
-        )
-
+        """Validate configuration parameters"""
+        assert self.latent_dim > 0, "latent_dim must be positive"
+        assert self.n_diffusion_steps > 0, "n_diffusion_steps must be positive"
+        assert self.n_cell_types > 0, "n_cell_types must be positive"
+        assert self.variance_type in ['fixed', 'learned'], \
+            f"variance_type must be 'fixed' or 'learned', got {self.variance_type}"
+        assert self.noise_hidden_dim > 0, "noise_hidden_dim must be positive"
+        assert self.noise_n_layers > 0, "noise_n_layers must be positive"
+        assert self.timestep_embed_dim > 0, "timestep_embed_dim must be positive"
+        assert self.celltype_embed_dim > 0, "celltype_embed_dim must be positive"
+        assert 0 <= self.dropout < 1, f"dropout must be in [0, 1), got {self.dropout}"
 
 # ============================================================================
-# TIMESTEP EMBEDDING
+# Logger
+# ============================================================================
+
+logger = Logger.get_logger(__name__)
+
+# ============================================================================
+# Sinusoidal Timestep Embedding
 # ============================================================================
 
 class SinusoidalTimestepEmbedding(nn.Module):
@@ -169,8 +103,6 @@ class SinusoidalTimestepEmbedding(nn.Module):
     Formula:
         PE(t, 2i)   = sin(t / 10000^(2i/d))
         PE(t, 2i+1) = cos(t / 10000^(2i/d))
-    
-    where d is the embedding dimension.
     """
     
     def __init__(self, embed_dim: int):
@@ -179,9 +111,6 @@ class SinusoidalTimestepEmbedding(nn.Module):
         
         Args:
             embed_dim: Dimension of timestep embedding (must be even)
-        
-        Raises:
-            ValueError: If embed_dim is not even
         """
         super().__init__()
         
@@ -190,14 +119,12 @@ class SinusoidalTimestepEmbedding(nn.Module):
         
         self.embed_dim = embed_dim
         
-        # Pre-compute frequency factors: 1 / 10000^(2i/d)    #TODO: verify
+        # Pre-compute frequency factors
         half_dim = embed_dim // 2
         freqs = torch.exp(
             -np.log(10000.0) * torch.arange(0, half_dim, dtype=torch.float32) / half_dim
         )
         self.register_buffer("freqs", freqs)
-        
-        logger.debug(f"Initialized SinusoidalTimestepEmbedding (dim={embed_dim})")
     
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         """
@@ -208,15 +135,9 @@ class SinusoidalTimestepEmbedding(nn.Module):
         
         Returns:
             Timestep embeddings, shape (batch_size, embed_dim)
-        
-        Raises:
-            ValueError: If t has invalid shape or dtype
         """
         if len(t.shape) != 1:
             raise ValueError(f"t must be 1D tensor, got shape {t.shape}")
-        
-        if t.dtype not in [torch.int64, torch.long]:
-            raise ValueError(f"t must have dtype long, got {t.dtype}")
         
         # t: (batch_size,) -> (batch_size, 1)
         t = t.float().unsqueeze(-1)
@@ -229,9 +150,8 @@ class SinusoidalTimestepEmbedding(nn.Module):
         
         return embeddings  # (batch_size, embed_dim)
 
-
 # ============================================================================
-# NOISE PREDICTION NETWORK
+# Noise Prediction Network
 # ============================================================================
 
 class NoisePredictionNetwork(nn.Module):
@@ -245,8 +165,7 @@ class NoisePredictionNetwork(nn.Module):
         4. Process through MLP
         5. Output: predicted noise ε̂ (same shape as z^(t))
     
-    The network is conditioned on both timestep and cell type, allowing it to
-    learn different denoising behaviors for different cell types.
+    The network is conditioned on both timestep and cell type.
     """
     
     def __init__(self, config: DDPMBackwardConfig):
@@ -259,12 +178,9 @@ class NoisePredictionNetwork(nn.Module):
         super().__init__()
         
         self.config = config
-        self.device = torch.device(config.device)
         
         # Timestep embedding: t -> embedding
-        self.timestep_embedding = SinusoidalTimestepEmbedding(
-            config.timestep_embed_dim
-        )
+        self.timestep_embedding = SinusoidalTimestepEmbedding(config.timestep_embed_dim)
         
         # Cell type embedding: c -> embedding (learnable)
         self.celltype_embedding = nn.Embedding(
@@ -273,51 +189,31 @@ class NoisePredictionNetwork(nn.Module):
         )
         
         # Input dimension: latent + timestep_embed + celltype_embed
-        input_dim = (
-            config.latent_dim +
-            config.timestep_embed_dim +
-            config.celltype_embed_dim
-        )
+        input_dim = config.latent_dim + config.timestep_embed_dim + config.celltype_embed_dim
         
-        # Build MLP: input -> hidden layers -> output
+        # Build MLP
         layers = []
+        current_dim = input_dim
         
-        # First layer
-        layers.append(nn.Linear(input_dim, config.noise_network_hidden_dim))
-        layers.append(nn.SiLU())  # Smooth activation (better than ReLU for diffusion)
-        layers.append(nn.Dropout(config.noise_network_dropout))
-        
-        # Hidden layers
-        for _ in range(config.noise_network_n_layers - 1):
-            layers.append(
-                nn.Linear(
-                    config.noise_network_hidden_dim,
-                    config.noise_network_hidden_dim
-                )
-            )
-            layers.append(nn.SiLU())
-            layers.append(nn.Dropout(config.noise_network_dropout))
+        for i in range(config.noise_n_layers):
+            layers.append(nn.Linear(current_dim, config.noise_hidden_dim))
+            layers.append(nn.SiLU())  # Smooth activation for diffusion models
+            layers.append(nn.Dropout(config.dropout))
+            current_dim = config.noise_hidden_dim
         
         # Output layer: predict noise (same dimension as latent)
-        layers.append(
-            nn.Linear(config.noise_network_hidden_dim, config.latent_dim)
-        )
+        layers.append(nn.Linear(current_dim, config.latent_dim))
         
         self.mlp = nn.Sequential(*layers)
         
         # Initialize weights
         self._initialize_weights()
         
-        logger.info(
-            f"Initialized NoisePredictionNetwork: "
-            f"input_dim={input_dim}, "
-            f"hidden_dim={config.noise_network_hidden_dim}, "
-            f"n_layers={config.noise_network_n_layers}"
-        )
+        logger.info(f"Initialized NoisePredictionNetwork: input_dim={input_dim}, "
+                   f"hidden_dim={config.noise_hidden_dim}, n_layers={config.noise_n_layers}")
     
     def _initialize_weights(self):
         """Initialize network weights using Xavier initialization."""
-        
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
@@ -342,48 +238,7 @@ class NoisePredictionNetwork(nn.Module):
         
         Returns:
             Predicted noise ε̂, shape (batch_size, latent_dim)
-        
-        Raises:
-            ValueError: If shapes or dtypes are invalid
         """
-        batch_size = z_t.shape[0]
-        
-        # Validate inputs
-        if z_t.shape[-1] != self.config.latent_dim:
-            raise ValueError(
-                f"z_t dimension mismatch. Expected {self.config.latent_dim}, "
-                f"got {z_t.shape[-1]}"
-            )
-        
-        if t.shape[0] != batch_size:
-            raise ValueError(
-                f"Batch size mismatch: z_t={batch_size}, t={t.shape[0]}"
-            )
-        
-        if cell_type.shape[0] != batch_size:
-            raise ValueError(
-                f"Batch size mismatch: z_t={batch_size}, cell_type={cell_type.shape[0]}"
-            )
-        
-        if t.dtype not in [torch.int64, torch.long]:
-            raise ValueError(f"t must have dtype long, got {t.dtype}")
-        
-        if cell_type.dtype not in [torch.int64, torch.long]:
-            raise ValueError(f"cell_type must have dtype long, got {cell_type.dtype}")
-        
-        # Check for invalid values
-        if (t < 0).any() or (t >= self.config.n_diffusion_steps).any():
-            raise ValueError(
-                f"Invalid timestep indices: min={t.min()}, max={t.max()}, "
-                f"valid range=[0, {self.config.n_diffusion_steps - 1}]"
-            )
-        
-        if (cell_type < 0).any() or (cell_type >= self.config.n_cell_types).any():
-            raise ValueError(
-                f"Invalid cell type indices: min={cell_type.min()}, "
-                f"max={cell_type.max()}, valid range=[0, {self.config.n_cell_types - 1}]"
-            )
-        
         # Embed timestep: (batch_size,) -> (batch_size, timestep_embed_dim)
         t_embed = self.timestep_embedding(t)
         
@@ -398,9 +253,8 @@ class NoisePredictionNetwork(nn.Module):
         
         return noise_pred
 
-
 # ============================================================================
-# VARIANCE PREDICTOR (FOR LEARNED VARIANCE)
+# Variance Predictor (for learned variance)
 # ============================================================================
 
 class VariancePredictor(nn.Module):
@@ -409,8 +263,6 @@ class VariancePredictor(nn.Module):
     
     Predicts log variance log(σ_t²) for the reverse process distribution.
     Can improve sample quality compared to fixed variance.
-    
-    Architecture is similar to noise predictor but outputs scalar variance.
     """
     
     def __init__(self, config: DDPMBackwardConfig):
@@ -423,32 +275,23 @@ class VariancePredictor(nn.Module):
         super().__init__()
         
         self.config = config
-        self.device = torch.device(config.device)
         
-        # Reuse same embedding modules as noise predictor
-        self.timestep_embedding = SinusoidalTimestepEmbedding(
-            config.timestep_embed_dim
-        )
-        
+        # Reuse same embedding modules
+        self.timestep_embedding = SinusoidalTimestepEmbedding(config.timestep_embed_dim)
         self.celltype_embedding = nn.Embedding(
             num_embeddings=config.n_cell_types,
             embedding_dim=config.celltype_embed_dim
         )
         
         # Input dimension
-        input_dim = (
-            config.latent_dim +
-            config.timestep_embed_dim +
-            config.celltype_embed_dim
+        input_dim = config.latent_dim + config.timestep_embed_dim + config.celltype_embed_dim
+        
+        # Smaller MLP for variance prediction
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, config.noise_hidden_dim // 2),
+            nn.SiLU(),
+            nn.Linear(config.noise_hidden_dim // 2, config.latent_dim)
         )
-        
-        # Smaller MLP for variance prediction (simpler task)
-        layers = []
-        layers.append(nn.Linear(input_dim, config.noise_network_hidden_dim // 2))
-        layers.append(nn.SiLU())
-        layers.append(nn.Linear(config.noise_network_hidden_dim // 2, config.latent_dim))
-        
-        self.mlp = nn.Sequential(*layers)
         
         logger.info("Initialized VariancePredictor for learned variance")
     
@@ -479,17 +322,16 @@ class VariancePredictor(nn.Module):
         
         return log_variance
 
-
 # ============================================================================
-# REVERSE PROCESS
+# DDPM Backward Process Module
 # ============================================================================
 
-class ReverseProcess(ABC, nn.Module):
+class DDPMBackwardModule(nn.Module):
     """
-    Abstract base class for reverse (denoising) diffusion process.
+    Reverse diffusion process module.
     
-    Defines the interface for computing mean, variance, and sampling from
-    the reverse process distribution p_ψ(z^(t-1) | z^(t), c).
+    Implements denoising using learned noise prediction network.
+    This process is LEARNED (trainable parameters in ε_ψ network).
     """
     
     def __init__(
@@ -498,18 +340,17 @@ class ReverseProcess(ABC, nn.Module):
         variance_schedule: Dict[str, torch.Tensor]
     ):
         """
-        Initialize reverse process.
+        Initialize backward process module.
         
         Args:
-            config: DDPMBackwardConfig with hyperparameters
-            variance_schedule: Dict with variance schedule components from forward process
-                Required keys: beta, alpha, alpha_cumprod, alpha_cumprod_prev,
-                             sqrt_alpha_cumprod, sqrt_one_minus_alpha_cumprod
+            config: Configuration object
+            variance_schedule: Variance schedule from forward process
+                Required keys: beta, alpha, alpha_cumprod, sqrt_alpha_cumprod,
+                             sqrt_one_minus_alpha_cumprod
         """
         super().__init__()
         
         self.config = config
-        self.device = torch.device(config.device)
         
         # Register variance schedule as buffers (not trainable)
         for key, value in variance_schedule.items():
@@ -517,13 +358,29 @@ class ReverseProcess(ABC, nn.Module):
         
         # Validate variance schedule
         self._validate_variance_schedule()
+        
+        # Initialize noise prediction network (learnable)
+        self.noise_network = NoisePredictionNetwork(config)
+        
+        # Initialize variance predictor (if learned variance)
+        if config.variance_type == 'learned':
+            self.variance_predictor = VariancePredictor(config)
+            logger.info("Using learned variance")
+        else:
+            self.variance_predictor = None
+            logger.info("Using fixed variance (β_t)")
+        
+        logger.info("Initialized DDPMBackwardModule")
+        logger.info(f"  latent_dim={config.latent_dim}")
+        logger.info(f"  n_diffusion_steps={config.n_diffusion_steps}")
+        logger.info(f"  n_cell_types={config.n_cell_types}")
+        logger.info(f"  variance_type={config.variance_type}")
     
     def _validate_variance_schedule(self):
         """Validate that all required variance schedule components are present."""
-        
         required_keys = [
-            "beta", "alpha", "alpha_cumprod", "alpha_cumprod_prev",
-            "sqrt_alpha_cumprod", "sqrt_one_minus_alpha_cumprod"
+            'beta', 'alpha', 'alpha_cumprod',
+            'sqrt_alpha_cumprod', 'sqrt_one_minus_alpha_cumprod'
         ]
         
         for key in required_keys:
@@ -534,41 +391,81 @@ class ReverseProcess(ABC, nn.Module):
             if schedule_tensor.shape[0] != self.config.n_diffusion_steps:
                 raise ValueError(
                     f"Variance schedule {key} has wrong length: "
-                    f"expected {self.config.n_diffusion_steps}, "
-                    f"got {schedule_tensor.shape[0]}"
+                    f"expected {self.config.n_diffusion_steps}, got {schedule_tensor.shape[0]}"
                 )
     
-    @abstractmethod
-    def compute_mean(
+    def _validate_inputs(
         self,
         z_t: torch.Tensor,
         t: torch.Tensor,
-        cell_type: torch.Tensor,
-        noise_pred: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+        cell_type: torch.Tensor
+    ) -> None:
         """
-        Compute mean μ_ψ(z^(t), t, c) of reverse process distribution.
+        Validate input tensors.
         
         Args:
-            z_t: Noisy latent, shape (batch_size, latent_dim)
-            t: Timesteps, shape (batch_size,)
-            cell_type: Cell types, shape (batch_size,)
-            noise_pred: Optional pre-computed noise prediction
+            z_t: Noisy latent tensor
+            t: Timestep tensor
+            cell_type: Cell type tensor
         
-        Returns:
-            Mean μ, shape (batch_size, latent_dim)
+        Raises:
+            ValueError: If inputs are invalid
         """
-        pass
+        batch_size = z_t.shape[0]
+        
+        # Check shapes
+        if z_t.dim() != 2:
+            raise ValueError(f"z_t must be 2D (batch_size, latent_dim), got shape {z_t.shape}")
+        
+        if z_t.shape[-1] != self.config.latent_dim:
+            raise ValueError(
+                f"Latent dimension mismatch. Expected {self.config.latent_dim}, got {z_t.shape[-1]}"
+            )
+        
+        if t.dim() != 1:
+            raise ValueError(f"t must be 1D (batch_size,), got shape {t.shape}")
+        
+        if t.shape[0] != batch_size:
+            raise ValueError(f"Batch size mismatch. z_t: {batch_size}, t: {t.shape[0]}")
+        
+        if cell_type.dim() != 1:
+            raise ValueError(f"cell_type must be 1D (batch_size,), got shape {cell_type.shape}")
+        
+        if cell_type.shape[0] != batch_size:
+            raise ValueError(f"Batch size mismatch. z_t: {batch_size}, cell_type: {cell_type.shape[0]}")
+        
+        # Check timestep range
+        if (t < 0).any() or (t >= self.config.n_diffusion_steps).any():
+            raise ValueError(
+                f"Timestep out of range [0, {self.config.n_diffusion_steps-1}]. "
+                f"Got min={t.min()}, max={t.max()}"
+            )
+        
+        # Check cell type range
+        if (cell_type < 0).any() or (cell_type >= self.config.n_cell_types).any():
+            raise ValueError(
+                f"Cell type out of range [0, {self.config.n_cell_types-1}]. "
+                f"Got min={cell_type.min()}, max={cell_type.max()}"
+            )
+        
+        # Check for NaN/Inf
+        if torch.isnan(z_t).any() or torch.isinf(z_t).any():
+            raise ValueError("z_t contains NaN or Inf values")
+        
+        if torch.isnan(t).any() or torch.isinf(t).any():
+            raise ValueError("t contains NaN or Inf values")
+        
+        if torch.isnan(cell_type).any() or torch.isinf(cell_type).any():
+            raise ValueError("cell_type contains NaN or Inf values")
     
-    @abstractmethod
-    def compute_variance(
+    def predict_noise(
         self,
         z_t: torch.Tensor,
         t: torch.Tensor,
         cell_type: torch.Tensor
     ) -> torch.Tensor:
         """
-        Compute variance σ² of reverse process distribution.
+        Predict noise ε̂ = ε_ψ(z^(t), t, c).
         
         Args:
             z_t: Noisy latent, shape (batch_size, latent_dim)
@@ -576,102 +473,10 @@ class ReverseProcess(ABC, nn.Module):
             cell_type: Cell types, shape (batch_size,)
         
         Returns:
-            Variance σ², shape (batch_size, latent_dim) or (batch_size, 1)
+            Predicted noise, shape (batch_size, latent_dim)
         """
-        pass
-    
-    def sample_step(
-        self,
-        z_t: torch.Tensor,
-        t: torch.Tensor,
-        cell_type: torch.Tensor
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """
-        Perform single reverse step: sample z^(t-1) ~ p_ψ(z^(t-1) | z^(t), c).
-        
-        Args:
-            z_t: Noisy latent at timestep t, shape (batch_size, latent_dim)
-            t: Timestep indices, shape (batch_size,)
-            cell_type: Cell type indices, shape (batch_size,)
-        
-        Returns:
-            Tuple of:
-                - z_t_minus_1: Denoised latent at timestep t-1, shape (batch_size, latent_dim)
-                - info_dict: Dictionary with intermediate values (noise_pred, mean, variance)
-        """
-        # Compute mean
-        mean = self.compute_mean(z_t, t, cell_type)
-        
-        # Compute variance
-        variance = self.compute_variance(z_t, t, cell_type)
-        
-        # Sample noise: ε' ~ N(0, I)
-        noise = torch.randn_like(z_t)
-        
-        # Compute standard deviation: σ = √(variance)
-        std = torch.sqrt(variance)
-        
-        # Sample: z^(t-1) = μ + σ * ε'
-        # Special case: at t=0, no noise is added (deterministic)
-        no_noise = (t == 0).float().reshape(-1, 1)  # (batch_size, 1)
-        z_t_minus_1 = mean + (1.0 - no_noise) * std * noise
-        
-        # Return results and info
-        info_dict = {
-            "mean": mean,
-            "variance": variance,
-            "std": std,
-            "noise_added": noise
-        }
-        
-        return z_t_minus_1, info_dict
-
-
-# ============================================================================
-# UNIFIED REVERSE PROCESS (SUPERVISED & UNSUPERVISED)
-# ============================================================================
-
-class DDPMReverseProcessUnified(ReverseProcess):
-    """
-    Unified reverse process for both supervised and unsupervised modes.
-    
-    The mathematical formulation is identical for both cases:
-        p_ψ(z^(t-1) | z^(t), c) = N(z^(t-1) | μ_ψ(z^(t), t, c), σ_t² I)
-    
-    Difference:
-        - Supervised: c = c* (known/fixed cell type)
-        - Unsupervised: c ~ p(c | z^(t), t) (predicted/random cell type)
-    
-    The reverse process itself doesn't distinguish between these cases;
-    the conditioning variable c is simply passed in.
-    """
-    
-    def __init__(
-        self,
-        config: DDPMBackwardConfig,
-        variance_schedule: Dict[str, torch.Tensor]
-    ):
-        """
-        Initialize unified reverse process.
-        
-        Args:
-            config: DDPMBackwardConfig with hyperparameters
-            variance_schedule: Dict with variance schedule from forward process
-        """
-        super().__init__(config, variance_schedule)
-        
-        # Initialize noise prediction network
-        self.noise_network = NoisePredictionNetwork(config)
-        
-        # Initialize variance predictor (if learned variance)
-        if config.variance_type == "learned":
-            self.variance_predictor = VariancePredictor(config)
-            logger.info("Using learned variance")
-        else:
-            self.variance_predictor = None
-            logger.info("Using fixed variance (β_t)")
-        
-        logger.info("Initialized DDPMReverseProcessUnified")
+        self._validate_inputs(z_t, t, cell_type)
+        return self.noise_network(z_t, t, cell_type)
     
     def compute_mean(
         self,
@@ -683,10 +488,8 @@ class DDPMReverseProcessUnified(ReverseProcess):
         """
         Compute mean μ_ψ(z^(t), t, c) using noise prediction formulation.
         
-        Formula:
+        Mathematical formula:
             μ_ψ(z^(t), t, c) = (1/√α_t) * (z^(t) - (β_t/√(1-ᾱ_t)) * ε̂)
-        
-        where ε̂ = ε_ψ(z^(t), t, c) is the predicted noise.
         
         Args:
             z_t: Noisy latent, shape (batch_size, latent_dim)
@@ -699,18 +502,12 @@ class DDPMReverseProcessUnified(ReverseProcess):
         """
         # Predict noise if not provided
         if noise_pred is None:
-            noise_pred = self.noise_network(z_t, t, cell_type)
+            noise_pred = self.predict_noise(z_t, t, cell_type)
         
         # Extract schedule components at timestep t
-        # All have shape (batch_size,)
-        beta_t = self.beta[t]
-        alpha_t = self.alpha[t]
-        sqrt_one_minus_alpha_cumprod_t = self.sqrt_one_minus_alpha_cumprod[t]
-        
-        # Reshape for broadcasting: (batch_size, 1)
-        beta_t = beta_t.reshape(-1, 1)
-        alpha_t = alpha_t.reshape(-1, 1)
-        sqrt_one_minus_alpha_cumprod_t = sqrt_one_minus_alpha_cumprod_t.reshape(-1, 1)
+        beta_t = self.beta[t].reshape(-1, 1)  # (batch_size, 1)
+        alpha_t = self.alpha[t].reshape(-1, 1)  # (batch_size, 1)
+        sqrt_one_minus_alpha_cumprod_t = self.sqrt_one_minus_alpha_cumprod[t].reshape(-1, 1)
         
         # Compute coefficient: β_t / √(1 - ᾱ_t)
         coef = beta_t / sqrt_one_minus_alpha_cumprod_t
@@ -741,12 +538,12 @@ class DDPMReverseProcessUnified(ReverseProcess):
         Returns:
             Variance σ², shape (batch_size, latent_dim) or (batch_size, 1)
         """
-        if self.config.variance_type == "fixed":
+        if self.config.variance_type == 'fixed':
             # Fixed variance: σ_t² = β_t
             beta_t = self.beta[t]  # (batch_size,)
             variance = beta_t.reshape(-1, 1)  # (batch_size, 1) for broadcasting
-            
-        elif self.config.variance_type == "learned":
+        
+        elif self.config.variance_type == 'learned':
             # Learned variance: σ_t² = exp(log_var)
             log_variance = self.variance_predictor(z_t, t, cell_type)
             variance = torch.exp(log_variance)  # (batch_size, latent_dim)
@@ -756,89 +553,72 @@ class DDPMReverseProcessUnified(ReverseProcess):
         
         return variance
     
-    def log_prob(
+    def reverse_step(
         self,
-        z_t_minus_1: torch.Tensor,
         z_t: torch.Tensor,
         t: torch.Tensor,
         cell_type: torch.Tensor
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        Compute log p_ψ(z^(t-1) | z^(t), c).
+        Perform single reverse step: sample z^(t-1) ~ p_ψ(z^(t-1) | z^(t), c).
         
-        Useful for computing loss during training.
+        Mathematical formulation:
+            z^(t-1) = μ_ψ(z^(t), t, c) + σ_t * ε', where ε' ~ N(0, I)
+        
+        Special case: at t=0, no noise is added (deterministic).
         
         Args:
-            z_t_minus_1: Denoised latent at t-1, shape (batch_size, latent_dim)
-            z_t: Noisy latent at t, shape (batch_size, latent_dim)
-            t: Timesteps, shape (batch_size,)
-            cell_type: Cell types, shape (batch_size,)
+            z_t: Noisy latent at timestep t, shape (batch_size, latent_dim)
+            t: Timestep indices, shape (batch_size,)
+            cell_type: Cell type indices, shape (batch_size,)
         
         Returns:
-            Log probability, shape (batch_size,)
+            z_t_minus_1: Denoised latent at timestep t-1, shape (batch_size, latent_dim)
+            info_dict: Dictionary with intermediate values
         """
-        # Compute mean and variance
+        self._validate_inputs(z_t, t, cell_type)
+        
+        # Compute mean
         mean = self.compute_mean(z_t, t, cell_type)
+        
+        # Compute variance
         variance = self.compute_variance(z_t, t, cell_type)
         
-        # Compute log probability: log N(z^(t-1) | μ, σ²I)
-        diff = z_t_minus_1 - mean
-        log_prob = -0.5 * (
-            torch.sum(diff ** 2 / variance, dim=1) +
-            torch.sum(torch.log(variance), dim=1) +
-            self.config.latent_dim * np.log(2 * np.pi)
-        )
+        # Sample noise: ε' ~ N(0, I)
+        noise = torch.randn_like(z_t)
         
-        return log_prob
-
-
-# ============================================================================
-# SAMPLING MANAGER
-# ============================================================================
-
-class DDPMSampler(nn.Module):
-    """
-    Manager for sampling from reverse process.
-    
-    Handles the full sampling trajectory:
-        z^(T) ~ N(0, I)  [start from Gaussian noise]
-        For t = T, T-1, ..., 1:
-            z^(t-1) ~ p_ψ(z^(t-1) | z^(t), c)  [iterative denoising]
-        Return z^(0)  [final denoised latent]
-    
-    Supports both supervised and unsupervised sampling.
-    """
-    
-    def __init__(
-        self,
-        config: DDPMBackwardConfig,
-        reverse_process: DDPMReverseProcessUnified
-    ):
-        """
-        Initialize sampler.
+        # Compute standard deviation: σ = √(variance)
+        std = torch.sqrt(variance)
         
-        Args:
-            config: DDPMBackwardConfig with hyperparameters
-            reverse_process: DDPMReverseProcessUnified instance
-        """
-        super().__init__()
+        # Sample: z^(t-1) = μ + σ * ε'
+        # Special case: at t=0, no noise is added (deterministic)
+        no_noise = (t == 0).float().reshape(-1, 1)  # (batch_size, 1)
+        z_t_minus_1 = mean + (1.0 - no_noise) * std * noise
         
-        self.config = config
-        self.device = torch.device(config.device)
-        self.reverse_process = reverse_process
+        # Return results and info
+        info_dict = {
+            'mean': mean,
+            'variance': variance,
+            'std': std,
+            'noise_added': noise
+        }
         
-        logger.info(
-            f"Initialized DDPMSampler with {config.n_diffusion_steps} steps"
-        )
+        return z_t_minus_1, info_dict
     
-    def sample(
+    def sample_trajectory(
         self,
         n_samples: int,
         cell_type: torch.Tensor,
         return_trajectory: bool = False
-    ) -> Tuple[torch.Tensor, Optional[Dict[str, list]]]:
+    ) -> Tuple[torch.Tensor, Optional[list]]:
         """
-        Sample from reverse process: z^(T) → z^(T-1) → ... → z^(0).
+        Sample full trajectory: z^(T) → z^(T-1) → ... → z^(0).
+        
+        Sampling process:
+            1. Start from Gaussian noise: z^(T) ~ N(0, I)
+            2. For t = T, T-1, ..., 1:
+                  z^(t-1) ~ p_ψ(z^(t-1) | z^(t), c)
+            3. Return z^(0)
         
         Args:
             n_samples: Number of samples to generate
@@ -846,70 +626,46 @@ class DDPMSampler(nn.Module):
             return_trajectory: If True, return full trajectory of latents
         
         Returns:
-            Tuple of:
-                - z_0: Final denoised latent, shape (n_samples, latent_dim)
-                - trajectory: Optional dict with keys:
-                    - "z": List of latents at each timestep (length T+1)
-                    - "noise_pred": List of predicted noise at each timestep
-        
-        Raises:
-            ValueError: If inputs are invalid
+            z_0: Final denoised latent, shape (n_samples, latent_dim)
+            trajectory: Optional list of latents at each timestep (if return_trajectory=True)
         """
         if n_samples <= 0:
-            raise ValueError(f"n_samples must be > 0, got {n_samples}")
+            raise ValueError(f"n_samples must be positive, got {n_samples}")
         
         if cell_type.shape[0] != n_samples:
             raise ValueError(
-                f"cell_type batch size mismatch: "
-                f"expected {n_samples}, got {cell_type.shape[0]}"
+                f"cell_type batch size mismatch: expected {n_samples}, got {cell_type.shape[0]}"
             )
-        
-        if cell_type.dtype not in [torch.int64, torch.long]:
-            raise ValueError(f"cell_type must have dtype long, got {cell_type.dtype}")
         
         # Initialize trajectory storage (if requested)
-        trajectory = {"z": [], "noise_pred": []} if return_trajectory else None
+        trajectory = [] if return_trajectory else None
         
         # Start from Gaussian noise: z^(T) ~ N(0, I)
-        z_t = torch.randn(
-            n_samples,
-            self.config.latent_dim,
-            device=self.device
-        )
+        z_t = torch.randn(n_samples, self.config.latent_dim, device=self.beta.device)
         
         if return_trajectory:
-            trajectory["z"].append(z_t.clone())
+            trajectory.append(z_t.clone())
         
-        logger.debug(
-            f"Sampling: Starting from z^(T) ~ N(0, I), shape={z_t.shape}"
-        )
+        logger.debug(f"Sampling: Starting from z^(T) ~ N(0, I), shape={z_t.shape}")
         
-        # Iteratively denoise: t = T, T-1, ..., 1
-        for step_idx in range(self.config.n_diffusion_steps):
-            # Current timestep
-            t_current = self.config.n_diffusion_steps - 1 - step_idx
-            
+        # Iteratively denoise: t = T-1, T-2, ..., 0
+        for step_idx in range(self.config.n_diffusion_steps - 1, -1, -1):
             # Create timestep tensor: (n_samples,)
-            t = torch.full(
-                (n_samples,),
-                t_current,
-                dtype=torch.long,
-                device=self.device
-            )
+            t = torch.full((n_samples,), step_idx, dtype=torch.long, device=self.beta.device)
             
             # Perform reverse step: z^(t) → z^(t-1)
-            z_t, info_dict = self.reverse_process.sample_step(z_t, t, cell_type)
+            z_t, info_dict = self.reverse_step(z_t, t, cell_type)
             
             # Store trajectory
             if return_trajectory:
-                trajectory["z"].append(z_t.clone())
-                trajectory["noise_pred"].append(info_dict.get("noise_pred"))
+                trajectory.append(z_t.clone())
             
             # Log progress periodically
             if (step_idx + 1) % 100 == 0 or step_idx == 0:
                 logger.debug(
-                    f"Sampling: Step {step_idx + 1}/{self.config.n_diffusion_steps}, "
-                    f"t={t_current}, z_norm={z_t.norm(dim=1).mean():.4f}"
+                    f"Sampling: Step {self.config.n_diffusion_steps - step_idx}/"
+                    f"{self.config.n_diffusion_steps}, t={step_idx}, "
+                    f"z_norm={z_t.norm(dim=1).mean():.4f}"
                 )
         
         logger.info(
@@ -919,109 +675,129 @@ class DDPMSampler(nn.Module):
         
         return z_t, trajectory
     
-    def sample_with_cell_type_inference(
+    def forward(
         self,
-        n_samples: int,
-        cell_type_classifier: nn.Module,
-        return_trajectory: bool = False
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[Dict[str, list]]]:
+        z_t: torch.Tensor,
+        t: torch.Tensor,
+        cell_type: torch.Tensor
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        Sample with cell type inference (unsupervised mode).
-        
-        In unsupervised mode, cell type c is not known. We can:
-            1. Sample c ~ p(c) from prior
-            2. Infer c from intermediate latent using classifier
-        
-        This method implements option 2: infer cell type from z^(T) or z^(T/2).
+        Forward pass: perform single reverse step.
         
         Args:
-            n_samples: Number of samples
-            cell_type_classifier: Neural network that predicts p(c | z)
-            return_trajectory: If True, return full trajectory
+            z_t: Noisy latent at timestep t, shape (batch_size, latent_dim)
+            t: Timestep indices, shape (batch_size,)
+            cell_type: Cell type indices, shape (batch_size,)
         
         Returns:
-            Tuple of:
-                - z_0: Final denoised latent, shape (n_samples, latent_dim)
-                - predicted_cell_types: Inferred cell types, shape (n_samples,)
-                - trajectory: Optional trajectory dict
+            z_t_minus_1: Denoised latent, shape (batch_size, latent_dim)
+            info_dict: Dictionary with intermediate values
         """
-        # Start from Gaussian noise: z^(T) ~ N(0, I)
-        z_T = torch.randn(
-            n_samples,
-            self.config.latent_dim,
-            device=self.device
-        )
-        
-        # Infer cell type from initial noise (or partially denoised)
-        with torch.no_grad():
-            # Classifier predicts: p(c | z^(T))
-            cell_type_logits = cell_type_classifier(z_T)
-            predicted_cell_types = torch.argmax(cell_type_logits, dim=-1)
-        
-        logger.info(
-            f"Unsupervised sampling: Inferred cell types from z^(T), "
-            f"unique types: {predicted_cell_types.unique().tolist()}"
-        )
-        
-        # Sample conditioned on predicted cell types
-        z_0, trajectory = self.sample(
-            n_samples=n_samples,
-            cell_type=predicted_cell_types,
-            return_trajectory=return_trajectory
-        )
-        
-        return z_0, predicted_cell_types, trajectory
-
+        return self.reverse_step(z_t, t, cell_type)
 
 # ============================================================================
-# UNIFIED REVERSE PROCESS MANAGER
+# Manager Class (Module Entry Point)
 # ============================================================================
 
-class ReverseProcessManager(nn.Module):
+class DDPMBackwardManager:
     """
-    Unified manager for reverse diffusion process.
+    Manager class for the DDPM Backward Process module.
     
-    Provides a clean interface for:
-        1. Reverse process initialization
-        2. Single-step denoising
-        3. Full trajectory sampling
-        4. Log probability computation
-    
-    Works seamlessly for both supervised and unsupervised modes.
+    This is the single entry point that:
+        1. Parses configuration from config.yaml
+        2. Initializes the backward process module
+        3. Exposes APIs for training/inference
     """
     
     def __init__(
         self,
-        config: DDPMBackwardConfig,
+        config_dict: Dict,
         variance_schedule: Dict[str, torch.Tensor]
     ):
         """
-        Initialize reverse process manager.
+        Initialize manager from configuration dictionary and variance schedule.
         
         Args:
-            config: DDPMBackwardConfig with hyperparameters
-            variance_schedule: Dict with variance schedule from forward process
+            config_dict: Dictionary containing 'ddpm_backward' section from config.yaml
+            variance_schedule: Variance schedule from DDPMForwardManager
         """
-        super().__init__()
+        logger.info("Initializing DDPMBackwardManager")
         
-        self.config = config
-        self.device = torch.device(config.device)
+        # Parse configuration
+        self.config = self._parse_config(config_dict)
         
-        # Initialize reverse process
-        self.reverse_process = DDPMReverseProcessUnified(
-            config=config,
-            variance_schedule=variance_schedule
-        )
+        # Store variance schedule
+        self.variance_schedule = variance_schedule
         
-        # Initialize sampler
-        self.sampler = DDPMSampler(
-            config=config,
-            reverse_process=self.reverse_process
-        )
+        # Initialize backward process module
+        self.backward_module = DDPMBackwardModule(self.config, variance_schedule)
         
-        logger.info("Initialized ReverseProcessManager")
+        logger.info("DDPMBackwardManager initialized successfully")
     
-    def single_step(
+    def _parse_config(self, config_dict: Dict) -> DDPMBackwardConfig:
+        """
+        Parse configuration dictionary into DDPMBackwardConfig.
+        
+        Args:
+            config_dict: Dictionary from config.yaml
+        
+        Returns:
+            DDPMBackwardConfig object
+        """
+        try:
+            config = DDPMBackwardConfig(
+                latent_dim=config_dict['latent_dim'],
+                n_diffusion_steps=config_dict['n_diffusion_steps'],
+                n_cell_types=config_dict['n_cell_types'],
+                variance_type=config_dict.get('variance_type', 'fixed'),
+                noise_hidden_dim=config_dict.get('noise_hidden_dim', 128),
+                noise_n_layers=config_dict.get('noise_n_layers', 2),
+                timestep_embed_dim=config_dict.get('timestep_embed_dim', 64),
+                celltype_embed_dim=config_dict.get('celltype_embed_dim', 32),
+                dropout=config_dict.get('dropout', 0.1)
+            )
+            
+            logger.info("Configuration parsed successfully")
+            return config
+        
+        except KeyError as e:
+            logger.error(f"Missing required configuration key: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Error parsing configuration: {e}")
+            raise
+    
+    def get_module(self) -> DDPMBackwardModule:
+        """
+        Get the backward process module.
+        
+        Returns:
+            DDPMBackwardModule instance
+        """
+        return self.backward_module
+    
+    def predict_noise(
+        self,
+        z_t: torch.Tensor,
+        t: torch.Tensor,
+        cell_type: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Predict noise ε̂ = ε_ψ(z^(t), t, c).
+        
+        This is the main API used during training to compute the denoising loss.
+        
+        Args:
+            z_t: Noisy latent, shape (batch_size, latent_dim)
+            t: Timesteps, shape (batch_size,)
+            cell_type: Cell types, shape (batch_size,)
+        
+        Returns:
+            Predicted noise, shape (batch_size, latent_dim)
+        """
+        return self.backward_module.predict_noise(z_t, t, cell_type)
+    
+    def reverse_step(
         self,
         z_t: torch.Tensor,
         t: torch.Tensor,
@@ -1036,208 +812,79 @@ class ReverseProcessManager(nn.Module):
             cell_type: Cell types, shape (batch_size,)
         
         Returns:
-            Tuple of (z_t_minus_1, info_dict)
+            z_t_minus_1: Denoised latent, shape (batch_size, latent_dim)
+            info_dict: Dictionary with intermediate values
         """
-        return self.reverse_process.sample_step(z_t, t, cell_type)
+        return self.backward_module.reverse_step(z_t, t, cell_type)
     
     def sample(
         self,
         n_samples: int,
         cell_type: torch.Tensor,
         return_trajectory: bool = False
-    ) -> Tuple[torch.Tensor, Optional[Dict[str, list]]]:
+    ) -> Tuple[torch.Tensor, Optional[list]]:
         """
-        Sample full trajectory: z^(T) → ... → z^(0).
+        Sample from reverse process: z^(T) → ... → z^(0).
+        
+        This is the main API used during inference to generate new samples.
         
         Args:
-            n_samples: Number of samples
-            cell_type: Cell types, shape (n_samples,)
+            n_samples: Number of samples to generate
+            cell_type: Cell type for each sample, shape (n_samples,)
             return_trajectory: If True, return full trajectory
         
         Returns:
-            Tuple of (z_0, trajectory)
+            z_0: Final denoised latent, shape (n_samples, latent_dim)
+            trajectory: Optional list of latents (if return_trajectory=True)
         """
-        return self.sampler.sample(n_samples, cell_type, return_trajectory)
+        return self.backward_module.sample_trajectory(n_samples, cell_type, return_trajectory)
     
-    def sample_unsupervised(
-        self,
-        n_samples: int,
-        cell_type_classifier: nn.Module,
-        return_trajectory: bool = False
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[Dict[str, list]]]:
+    def get_parameters(self) -> Dict[str, torch.nn.Parameter]:
         """
-        Sample with cell type inference (unsupervised).
-        
-        Args:
-            n_samples: Number of samples
-            cell_type_classifier: Cell type classifier network
-            return_trajectory: If True, return trajectory
+        Get all trainable parameters.
         
         Returns:
-            Tuple of (z_0, predicted_cell_types, trajectory)
+            Dictionary of named parameters (includes noise network and optional variance predictor)
         """
-        return self.sampler.sample_with_cell_type_inference(
-            n_samples, cell_type_classifier, return_trajectory
-        )
-    
-    def predict_noise(
-        self,
-        z_t: torch.Tensor,
-        t: torch.Tensor,
-        cell_type: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Predict noise ε̂ = ε_ψ(z^(t), t, c).
-        
-        Args:
-            z_t: Noisy latent, shape (batch_size, latent_dim)
-            t: Timesteps, shape (batch_size,)
-            cell_type: Cell types, shape (batch_size,)
-        
-        Returns:
-            Predicted noise, shape (batch_size, latent_dim)
-        """
-        return self.reverse_process.noise_network(z_t, t, cell_type)
-    
-    def compute_log_prob(
-        self,
-        z_t_minus_1: torch.Tensor,
-        z_t: torch.Tensor,
-        t: torch.Tensor,
-        cell_type: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Compute log p_ψ(z^(t-1) | z^(t), c).
-        
-        Args:
-            z_t_minus_1: Denoised latent, shape (batch_size, latent_dim)
-            z_t: Noisy latent, shape (batch_size, latent_dim)
-            t: Timesteps, shape (batch_size,)
-            cell_type: Cell types, shape (batch_size,)
-        
-        Returns:
-            Log probability, shape (batch_size,)
-        """
-        return self.reverse_process.log_prob(z_t_minus_1, z_t, t, cell_type)
-    
-    def log_info(self):
-        """Log detailed configuration information."""
-        
-        logger.info("=" * 70)
-        logger.info("ReverseProcessManager Configuration")
-        logger.info("=" * 70)
-        logger.info(f"Latent dimension: {self.config.latent_dim}")
-        logger.info(f"Diffusion steps: {self.config.n_diffusion_steps}")
-        logger.info(f"Cell types: {self.config.n_cell_types}")
-        logger.info(f"Variance type: {self.config.variance_type}")
-        logger.info(f"Noise network hidden dim: {self.config.noise_network_hidden_dim}")
-        logger.info(f"Noise network layers: {self.config.noise_network_n_layers}")
-        logger.info(f"Timestep embed dim: {self.config.timestep_embed_dim}")
-        logger.info(f"Cell type embed dim: {self.config.celltype_embed_dim}")
-        logger.info("=" * 70)
-
+        return dict(self.backward_module.named_parameters())
 
 # ============================================================================
-# UTILITY FUNCTIONS
+# Config YAML Schema Documentation
 # ============================================================================
 
-def create_reverse_process_manager(
-    latent_dim: int,
-    n_diffusion_steps: int,
-    n_cell_types: int,
-    variance_schedule: Dict[str, torch.Tensor],
-    variance_type: str = "fixed",
-    noise_network_hidden_dim: int = 256,
-    noise_network_n_layers: int = 3,
-    device: str = "cpu"
-) -> ReverseProcessManager:
-    """
-    Factory function to create reverse process manager with sensible defaults.
-    
-    Args:
-        latent_dim: Dimension of latent space
-        n_diffusion_steps: Number of diffusion steps
-        n_cell_types: Number of cell types
-        variance_schedule: Variance schedule from forward process
-        variance_type: "fixed" or "learned"
-        noise_network_hidden_dim: Hidden dimension for noise network
-        noise_network_n_layers: Number of layers in noise network
-        device: Device to use
-    
-    Returns:
-        ReverseProcessManager instance
-    """
-    config = DDPMBackwardConfig(
-        latent_dim=latent_dim,
-        n_diffusion_steps=n_diffusion_steps,
-        n_cell_types=n_cell_types,
-        variance_type=variance_type,
-        noise_network_hidden_dim=noise_network_hidden_dim,
-        noise_network_n_layers=noise_network_n_layers,
-        device=device
-    )
-    
-    manager = ReverseProcessManager(
-        config=config,
-        variance_schedule=variance_schedule
-    )
-    
-    return manager
+"""
+Example usage:
+--------------
 
+```python
+import yaml
+from ddpm_forward import DDPMForwardManager
+from ddpm_backward import DDPMBackwardManager
 
-def validate_reverse_inputs(
-    z_t: torch.Tensor,
-    t: torch.Tensor,
-    cell_type: torch.Tensor,
-    config: DDPMBackwardConfig
-) -> None:
-    """
-    Validate inputs for reverse process.
-    
-    Args:
-        z_t: Noisy latent
-        t: Timesteps
-        cell_type: Cell types
-        config: Configuration
-    
-    Raises:
-        ValueError: If validation fails
-    """
-    batch_size = z_t.shape[0]
-    
-    if z_t.shape[-1] != config.latent_dim:
-        raise ValueError(
-            f"Latent dimension mismatch: expected {config.latent_dim}, "
-            f"got {z_t.shape[-1]}"
-        )
-    
-    if t.shape[0] != batch_size:
-        raise ValueError(
-            f"Batch size mismatch: z_t={batch_size}, t={t.shape[0]}"
-        )
-    
-    if cell_type.shape[0] != batch_size:
-        raise ValueError(
-            f"Batch size mismatch: z_t={batch_size}, cell_type={cell_type.shape[0]}"
-        )
-    
-    if (t < 0).any() or (t >= config.n_diffusion_steps).any():
-        raise ValueError(
-            f"Invalid timesteps: min={t.min()}, max={t.max()}, "
-            f"valid range=[0, {config.n_diffusion_steps - 1}]"
-        )
-    
-    if (cell_type < 0).any() or (cell_type >= config.n_cell_types).any():
-        raise ValueError(
-            f"Invalid cell types: min={cell_type.min()}, max={cell_type.max()}, "
-            f"valid range=[0, {config.n_cell_types - 1}]"
-        )
-    
-    if z_t.isnan().any() or z_t.isinf().any():
-        raise ValueError("z_t contains NaN or Inf values")
-    
-    if t.isnan().any() or t.isinf().any():
-        raise ValueError("t contains NaN or Inf values")
-    
-    if cell_type.isnan().any() or cell_type.isinf().any():
-        raise ValueError("cell_type contains NaN or Inf values")
+# Load config
+with open('config.yaml', 'r') as f:
+    config = yaml.safe_load(f)
+
+# Initialize forward process (to get variance schedule)
+forward_manager = DDPMForwardManager(config['ddpm_forward'])
+variance_schedule = forward_manager.get_schedule()
+
+# Initialize backward process
+backward_manager = DDPMBackwardManager(
+    config['ddpm_backward'],
+    variance_schedule
+)
+
+# Get module for training
+backward_module = backward_manager.get_module()
+
+# Training: predict noise for loss computation
+z_t, noise_true, t = forward_manager.add_noise(z_0)
+noise_pred = backward_manager.predict_noise(z_t, t, cell_type)
+loss = F.mse_loss(noise_pred, noise_true)
+
+# Inference: sample new latents
+cell_type = torch.tensor([0, 1, 2, 3, 4] * 10)  # 50 samples, mixed cell types
+z_0_generated = backward_manager.sample(n_samples=50, cell_type=cell_type)
+```
+"""

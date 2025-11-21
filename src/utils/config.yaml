@@ -61,4 +61,16 @@ ddpm_forward:
 
 
 
-  
+ddpm_backward:
+    # Required parameters
+    latent_dim: 10                  # Dimension of latent space z^(0)
+    n_diffusion_steps: 1000         # Number of diffusion timesteps T
+    n_cell_types: 8                 # Number of cell types C
+    
+    # Optional parameters (with defaults)
+    variance_type: 'fixed'          # Variance strategy: 'fixed' or 'learned'
+    noise_hidden_dim: 128           # Hidden dimension for noise prediction network
+    noise_n_layers: 2               # Number of layers in noise prediction network
+    timestep_embed_dim: 64          # Dimension of timestep embedding
+    celltype_embed_dim: 32          # Dimension of cell type embedding
+    dropout: 0.1                    # Dropout rate for noise prediction network
