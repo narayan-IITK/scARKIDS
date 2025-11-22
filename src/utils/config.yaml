@@ -91,3 +91,18 @@ encoder:
   use_layer_norm: false   # Use layer normalization (default: false)
   input_transform: 'log1p' # Input transformation: 'log1p' or 'none' (default: 'log1p')
   eps: 1.0e-8             # Numerical stability constant (default: 1e-8)
+
+
+
+classifier:
+  # Required parameters
+  n_genes: 2000              # Number of genes in expression data
+  n_cell_types: 8            # Number of cell types to classify
+  n_batches: 5               # Number of batches in dataset
+  
+  # Optional parameters (with defaults)
+  hidden_dim: 256            # Hidden layer dimension for MLP
+  n_layers: 3                # Number of hidden layers in MLP
+  batch_embed_dim: 32        # Dimension of batch embedding
+  dropout: 0.2               # Dropout rate for regularization
+  use_batch_norm: true       # Whether to use batch normalization
