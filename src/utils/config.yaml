@@ -74,3 +74,20 @@ ddpm_backward:
     timestep_embed_dim: 64          # Dimension of timestep embedding
     celltype_embed_dim: 32          # Dimension of cell type embedding
     dropout: 0.1                    # Dropout rate for noise prediction network
+
+
+
+encoder:
+  # Required parameters
+  n_genes: 2000           # Number of input genes
+  n_batches: 5            # Number of batches
+  n_cell_types: 8         # Number of cell types
+  latent_dim: 10          # Dimension of latent space z^(0)
+  
+  # Optional parameters (with defaults)
+  hidden_dims: [256, 128] # Hidden layer dimensions (default: [256, 128])
+  dropout: 0.1            # Dropout rate (default: 0.1)
+  use_batch_norm: true    # Use batch normalization (default: true)
+  use_layer_norm: false   # Use layer normalization (default: false)
+  input_transform: 'log1p' # Input transformation: 'log1p' or 'none' (default: 'log1p')
+  eps: 1.0e-8             # Numerical stability constant (default: 1e-8)
