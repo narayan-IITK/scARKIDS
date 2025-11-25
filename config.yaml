@@ -1,0 +1,257 @@
+# ============================================================================
+# scARKIDS Configuration File
+# ============================================================================
+# This is the single source of configuration for the entire VAE-DDPM pipeline.
+#
+# Configuration Structure:
+# 1. Global parameters (shared across multiple modules)
+# 2. Data parameters (dataset-specific)
+# 3. Module-specific parameters (override globals if needed)
+# 4. Training/Inference parameters
+#
+# Note: Common parameters are defined in 'global' section and automatically
+# inherited by all modules. Module-specific sections can override these.
+# ============================================================================
+
+# ============================================================================
+# Global Parameters (Shared Across Modules)
+# ============================================================================
+global:
+  # Core dimensions
+  latent_dim: 10                    # Dimension of latent space z^(0)
+  n_diffusion_steps: 1000          # Number of diffusion timesteps T
+  
+  # Data dimensions (inferred from dataset or specified)
+  n_genes: 2000                    # Number of genes (same across all batches - anchor genes)
+  n_batches: 3                     # Number of batches B
+  n_cell_types: 8                  # Number of cell types C
+  
+  # Model mode
+  supervised: false                # true: c* known, false: c inferred
+  
+  # Numerical stability
+  eps: 1.0e-8                      # Small constant for numerical stability
+  
+  # Regularization (can be overridden per module)
+  dropout: 0.1                     # Default dropout rate
+  use_batch_norm: true             # Use batch normalization by default
+
+# ============================================================================
+# Data Configuration
+# ============================================================================
+data:
+  # Dataset paths
+  train_data_path: "data/train.h5ad"
+  val_data_path: "data/val.h5ad"
+  test_data_path: "data/test.h5ad"
+  
+  # Data preprocessing
+  log_transform: true              # Apply log1p transformation
+  normalize: true                  # Normalize by library size
+  
+  # Cell type and batch information
+  cell_type_key: "cell_type"       # Key in adata.obs for cell type labels
+  batch_key: "batch"               # Key in adata.obs for batch labels
+  
+  # Optional: Empirical priors (computed from data if not specified)
+  # cell_type_prior_probs: [0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125]  # Uniform
+  # batch_prior_probs: [0.333, 0.333, 0.334]  # Uniform
+
+# ============================================================================
+# Module Configurations
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Encoder Module (VAE Encoder q_φ)
+# ----------------------------------------------------------------------------
+encoder:
+  # Inherits: latent_dim, n_genes, n_batches, n_cell_types, eps, dropout, use_batch_norm from global
+  
+  # Architecture
+  hidden_dims: [256, 128]          # List of hidden layer dimensions
+  # dropout: 0.1                   # Inherited from global, uncomment to override
+  # use_batch_norm: true           # Inherited from global
+  use_layer_norm: false            # Alternative to batch norm (mutually exclusive)
+  
+  # Input preprocessing
+  input_transform: "log1p"         # Options: 'log1p', 'none'
+  
+  # Numerical stability
+  # eps: 1.0e-8                    # Inherited from global
+
+# ----------------------------------------------------------------------------
+# Classifier Module (Cell Type Classifier q_ω)
+# ----------------------------------------------------------------------------
+classifier:
+  # Inherits: n_genes, n_cell_types, n_batches, use_batch_norm from global
+  
+  # Architecture
+  hidden_dim: 256                  # Hidden layer dimension
+  n_layers: 3                      # Number of hidden layers
+  batch_embed_dim: 32              # Dimension of batch embedding
+  
+  # Regularization
+  dropout: 0.2                     # Override global dropout (classifier needs more)
+  # use_batch_norm: true           # Inherited from global
+
+# ----------------------------------------------------------------------------
+# Likelihood Module (ZINB Decoder p_θ)
+# ----------------------------------------------------------------------------
+likelihood:
+  # Inherits: latent_dim, n_genes, n_batches, eps from global
+  
+  # Decoder architecture
+  hidden_dim: 128                  # Hidden layer dimension for decoders
+  n_layers: 2                      # Number of hidden layers
+  
+  # ZINB parameters
+  dispersion_mode: "gene"          # Options: 'gene' (gene-specific θ_g)
+  use_library_size: true           # Include log(s_bn) in mean parameterization
+  
+  # Numerical stability
+  # eps: 1.0e-8                    # Inherited from global
+
+# ----------------------------------------------------------------------------
+# Prior Module (p(z^(0)|c), p(c), p(z^(T)))
+# ----------------------------------------------------------------------------
+prior:
+  # Inherits: latent_dim, n_cell_types, n_batches, supervised from global
+  
+  # Cell type prior probabilities (if not specified, uses uniform)
+  # cell_type_prior_probs: null    # null for uniform, or list of probabilities
+  
+  # Batch prior probabilities (if not specified, uses uniform)
+  # batch_prior_probs: null        # null for uniform, or list of probabilities
+
+# ----------------------------------------------------------------------------
+# DDPM Forward Process Module (q(z^(t)|z^(t-1)))
+# ----------------------------------------------------------------------------
+ddpm_forward:
+  # Inherits: latent_dim, n_diffusion_steps from global
+  
+  # Variance schedule
+  beta_schedule: "linear"          # Options: 'linear', 'cosine', 'quadratic'
+  beta_min: 1.0e-4                 # Minimum β_t value
+  beta_max: 2.0e-2                 # Maximum β_t value
+
+# ----------------------------------------------------------------------------
+# DDPM Backward Process Module (p_ψ(z^(t-1)|z^(t), c))
+# ----------------------------------------------------------------------------
+ddpm_backward:
+  # Inherits: latent_dim, n_diffusion_steps, n_cell_types, dropout from global
+  
+  # Reverse process variance
+  variance_type: "fixed"           # Options: 'fixed', 'learned'
+  
+  # Noise prediction network architecture
+  noise_hidden_dim: 128            # Hidden dimension for ε_ψ network
+  noise_n_layers: 2                # Number of layers in ε_ψ network
+  
+  # Embedding dimensions
+  timestep_embed_dim: 64           # Dimension of timestep embedding
+  celltype_embed_dim: 32           # Dimension of cell type embedding
+  
+  # Regularization
+  # dropout: 0.1                   # Inherited from global
+
+# ----------------------------------------------------------------------------
+# Variational Posterior Module (q_φ,ω)
+# ----------------------------------------------------------------------------
+variational_posterior:
+  # Inherits: supervised, latent_dim, n_diffusion_steps, n_cell_types from global
+  # Note: This module orchestrates encoder, classifier, and ddpm_forward
+  # Its configuration is derived from those modules
+
+# ----------------------------------------------------------------------------
+# ELBO Module (Loss Computation)
+# ----------------------------------------------------------------------------
+elbo:
+  # Inherits: supervised, latent_dim, n_diffusion_steps, n_cell_types from global
+  # Note: This module orchestrates all atomic modules for loss computation
+  # Its configuration is derived from those modules
+
+# ============================================================================
+# Training Configuration
+# ============================================================================
+training:
+  # Inherits: supervised from global
+  
+  # Training loop
+  n_epochs: 100                    # Number of training epochs
+  batch_size: 256                  # Mini-batch size
+  
+  # Optimization
+  learning_rate: 1.0e-3            # Initial learning rate
+  weight_decay: 1.0e-5             # L2 regularization coefficient
+  grad_clip_norm: 1.0              # Maximum gradient norm for clipping
+  
+  # Learning rate scheduling
+  lr_scheduler: "cosine"           # Options: 'cosine', 'step', 'plateau', null
+  lr_warmup_epochs: 5              # Number of warmup epochs
+  
+  # Logging and checkpointing
+  log_interval: 100                # Log metrics every N batches
+  checkpoint_interval: 1           # Save checkpoint every N epochs
+  checkpoint_dir: "./checkpoints"  # Directory to save checkpoints
+  
+  # Hardware
+  device: "cuda"                   # Options: 'cuda', 'cpu', or specific device like 'cuda:0'
+  use_amp: false                   # Use automatic mixed precision (requires CUDA)
+  
+  # Random seed (for reproducibility)
+  seed: 42
+
+# ============================================================================
+# Inference Configuration
+# ============================================================================
+inference:
+  # DDPM refinement (optional)
+  use_ddpm_refinement: false       # Whether to apply DDPM refinement
+  n_refinement_steps: null         # Number of steps (null uses n_diffusion_steps)
+  
+  # Batch correction
+  default_target_batch: 0          # Default target batch for correction
+  
+  # Output options
+  save_latent_embeddings: true     # Save z^(0) embeddings
+  save_corrected_expression: true  # Save batch-corrected x̂
+  save_cell_type_predictions: true # Save predicted cell types
+  
+  # Output paths
+  output_dir: "./results"
+
+# ============================================================================
+# Example: Alternative Configuration for Supervised Mode
+# ============================================================================
+# To switch to supervised mode, change:
+# global:
+#   supervised: true
+#
+# This will automatically configure:
+# - prior: uses cell-type-specific p(z^(0)|c*) with learnable μ_c, Σ_c
+# - variational_posterior: expects c* as input
+# - elbo: computes supervised ELBO
+# - training: requires cell type labels in data
+
+# ============================================================================
+# Configuration Inheritance and Override Rules
+# ============================================================================
+# 1. Parameters in 'global' are automatically inherited by all modules
+# 2. Module-specific parameters override global parameters
+# 3. Required parameters MUST be specified (either globally or per-module)
+# 4. Optional parameters use defaults if not specified
+#
+# Common parameters that are shared:
+# - latent_dim: encoder, likelihood, prior, ddpm_forward, ddpm_backward, 
+#               variational_posterior, elbo
+# - n_diffusion_steps: ddpm_forward, ddpm_backward, variational_posterior, elbo
+# - n_genes: encoder, classifier, likelihood
+# - n_batches: encoder, classifier, likelihood, prior
+# - n_cell_types: encoder, classifier, prior, ddpm_backward, 
+#                 variational_posterior, elbo
+# - supervised: prior, variational_posterior, elbo, training
+# - dropout: encoder, classifier, ddpm_backward
+# - eps: encoder, likelihood
+# - use_batch_norm: encoder, classifier
+#
+# This design eliminates redundancy while allowing fine-grained control.
